@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Daylight TV</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;800&display=swap" rel="stylesheet">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.17/hls.min.js"></script>
+<style>
+:root{--bg:#f6f7fb;--panel:#ffffff;--line:#e2e5ef;--text:#14161f;--dim:#666c82;--accent:#f59e0b;--live:#e5383b;color-scheme:light}
+*{box-sizing:border-box;margin:0}
+html,body{background:var(--bg);color:var(--text);font-family:"Bricolage Grotesque",system-ui,sans-serif}
+body{padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0)}
+.player{position:sticky;top:0;z-index:5;background:#000;display:none}
+.player.on{display:block}
+video{width:100%;max-height:42vh;display:block;background:#000}
+.now{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line);font-weight:600;font-size:14px}
+.now span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--live)}
+.msg{padding:8px 12px;font-size:13px;color:#b45309;background:var(--panel);display:none}
+header{padding:14px 12px 6px}
+h1{font-size:22px;font-weight:800;margin-bottom:10px}
+.row{display:flex;gap:8px}
+input,select{flex:1;min-width:0;background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:11px 12px;font:inherit;font-size:15px}
+select{flex:0 0 42%}
+input:focus,select:focus,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.chips{display:flex;gap:6px;overflow-x:auto;padding:10px 12px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chips.open{flex-wrap:wrap;overflow:visible}
+.chip{flex:none;border:1px solid var(--line);background:none;color:var(--dim);border-radius:99px;padding:7px 13px;font:inherit;font-size:13px;cursor:pointer}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#1a1300;font-weight:600}
+.count{padding:0 12px 6px;font-size:12px;color:var(--dim)}
+.list{padding:0 12px 24px;display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.ch{box-shadow:0 1px 2px rgba(20,22,31,.06);display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;cursor:pointer;text-align:left;color:inherit;font:inherit;width:100%}
+.ch.play{border-color:var(--accent)}
+.logo{width:44px;height:44px;border-radius:8px;background:#fff;border:1px solid var(--line);object-fit:contain;flex:none}
+.ph{width:44px;height:44px;border-radius:8px;background:var(--line);flex:none;display:grid;place-items:center;font-weight:800;color:var(--dim)}
+.meta{flex:1;min-width:0}
+.name{font-weight:600;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub{font-size:12px;color:var(--dim);margin-top:2px}
+.star{background:none;border:0;font-size:22px;color:var(--dim);cursor:pointer;padding:6px}
+.star.on{color:var(--accent)}
+.more{display:block;margin:0 auto 28px;padding:11px 22px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--text);font:inherit;cursor:pointer}
+.empty{padding:40px 20px;text-align:center;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="player" id="player">
+  <video id="v" controls playsinline autoplay></video>
+  <div class="now"><i class="dot"></i><span id="nowname"></span><button class="star" id="nowstar" aria-label="Favorite">★</button><button class="star" id="close" aria-label="Close player">✕</button></div>
+  <div class="msg" id="msg"></div>
+</div>
+<header>
+  <h1>Daylight TV</h1>
+  <div class="row">
+    <input id="q" type="search" placeholder="Search channels" autocomplete="off">
+    <select id="country" aria-label="Country or group"><option value="">All countries &amp; groups</option></select>
+  </div>
+</header>
+<div class="chips" id="chips"></div>
+<div class="count" id="count">Loading channels…</div>
+<div class="list" id="list"></div>
+<button class="more" id="more" hidden>Show more</button>
+
+<script>
+const PLAYLIST = "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlist.m3u8";
+const tg = window.Telegram && window.Telegram.WebApp;
+try { tg && (tg.ready(), tg.expand()); } catch (e) {}
+
+// Favorites: Telegram CloudStorage (syncs across devices), localStorage fallback
+const store = {
+  get(k) {
+    return new Promise(res => {
+      try { if (tg && tg.CloudStorage && tg.isVersionAtLeast("6.9")) return tg.CloudStorage.getItem(k, (e, v) => res(e ? null : v)); } catch (e) {}
+      try { res(localStorage.getItem(k)); } catch (e) { res(null); }
+    });
+  },
+  set(k, v) {
+    try { if (tg && tg.CloudStorage && tg.isVersionAtLeast("6.9")) return tg.CloudStorage.setItem(k, v); } catch (e) {}
+    try { localStorage.setItem(k, v); } catch (e) {}
+  }
+};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const regionName = x => x;
+
+let channels = [], streams = {}, favs = new Set(), dead = new Set();
+let state = {q: "", country: "", cat: "all", shown: 60, playing: null};
+let hls = null, urls = [], idx = 0;
+
+const RX = {
+  sports: /sport|espn|football|soccer|nba|nfl|ufc|golf|tennis|racing|motogp|eurosport|dazn/i,
+  news: /news|noticias|cnn|euronews|jazeera|bloomberg|cnbc|france 24|\bdw\b|tg ?24|tg ?\d|rai news|nachrichten/i,
+  kids: /kid|junior|cartoon|nick|disney|boomerang|toon|baby|clan|gulli/i,
+  movies: /movie|cine|film|kino|cinema|western/i,
+  music: /music|mtv|radio|hits|vh1|trace|mezzo|vevo/i,
+  documentary: /document|discovery|history|nat geo|national geographic|science|planet|nature|crime/i,
+  anime: /anime|animax|crunchyroll|manga|otaku|toonami|naruto|pokemon|dragon ?ball|gundam|doraemon|one piece/i
+};
+
+function parseM3U(text) {
+  const map = new Map();
+  let cur = null, skip = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const l = raw.trim();
+    if (!l) continue;
+    if (l.startsWith("#EXTINF")) {
+      const attr = k => { const m = l.match(new RegExp(k + '="([^"]*)"')); return m ? m[1] : ""; };
+      let name = l.slice(l.lastIndexOf(",") + 1).trim();
+      const geo = name.includes("Ⓖ"), yt = name.includes("Ⓨ");
+      name = name.replace(/[ⓈⒼⓎ]/g, "").replace(/\s+/g, " ").trim();
+      cur = {tvg: attr("tvg-id"), logo: attr("tvg-logo"), group: attr("group-title"), name, geo};
+      skip = yt; // YouTube live channels can't play in this player
+    } else if (l.startsWith("#EXTVLCOPT")) {
+      skip = true; // needs special headers
+    } else if (l[0] !== "#" && cur) {
+      const bad = /youtube\.com|youtu\.be|dailymotion\.com|\.mpd(\?|$)/i.test(l);
+      if (!skip && !bad && l.startsWith("https://")) {
+        const key = (cur.tvg || cur.name) + "|" + cur.group;
+        if (!map.has(key)) {
+          map.set(key, {id: key, name: cur.name, logo: cur.logo, country: cur.group, geo: cur.geo,
+            categories: Object.keys(RX).filter(k => RX[k].test(cur.name))});
+          streams[key] = [];
+        }
+        streams[key].push(l);
+      }
+      cur = null;
+    }
+  }
+  return [...map.values()];
+}
+
+async function init() {
+  try {
+    const [txt, fv] = await Promise.all([fetch(PLAYLIST).then(r => r.text()), store.get("favs-ftv")]);
+    try { favs = new Set(JSON.parse(fv || "[]")); } catch (e) {}
+    try { const d = JSON.parse(localStorage.getItem("dead-ftv") || "{}"); for (const k in d) if (Date.now() - d[k] < 43200000) dead.add(k); } catch (e) {}
+    channels = parseM3U(txt).sort((a, b) => a.name.localeCompare(b.name));
+    buildFilters();
+    render();
+  } catch (e) {
+    $("count").textContent = "Couldn't load channels. Check your connection and reopen the app.";
+  }
+}
+
+const ICONS = {sports:"⚽",anime:"🎌",movies:"🎬",news:"📰",kids:"🧸",music:"🎵",documentary:"🌍"};
+const FIRST = ["sports","news","kids","movies","music","documentary","anime"];
+
+function buildFilters() {
+  const groups = [...new Set(channels.map(c => c.country).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  $("country").insertAdjacentHTML("beforeend", groups.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join(""));
+  const tally = {};
+  channels.forEach(c => c.categories.forEach(k => tally[k] = (tally[k] || 0) + 1));
+  const label = k => ICONS[k] + " " + k.charAt(0).toUpperCase() + k.slice(1) + " " + tally[k];
+  $("chips").innerHTML =
+    `<button class="chip on" data-c="all">All ${channels.length}</button><button class="chip" data-c="__fav">★ Favorites</button>` +
+    FIRST.filter(k => tally[k]).map(k => `<button class="chip" data-c="${k}">${esc(label(k))}</button>`).join("");
+}
+
+function filtered() {
+  const q = state.q.trim().toLowerCase();
+  return channels.filter(c =>
+    !dead.has(c.id) &&
+    (!q || c.name.toLowerCase().includes(q)) &&
+    (!state.country || c.country === state.country) &&
+    (state.cat === "all" || (state.cat === "__fav" ? favs.has(c.id) : (c.categories || []).includes(state.cat)))
+  );
+}
+
+function render() {
+  const list = filtered();
+  $("count").textContent = list.length + " channel" + (list.length === 1 ? "" : "s");
+  const html = list.slice(0, state.shown).map(c => {
+    const logo = c.logo ? `<img class="logo" src="${esc(c.logo)}" alt="" loading="lazy" onerror="this.outerHTML='<div class=ph>${esc(c.name.charAt(0))}</div>'">` : `<div class="ph">${esc(c.name.charAt(0))}</div>`;
+    return `<div class="ch${state.playing === c.id ? " play" : ""}" data-id="${esc(c.id)}" role="button" tabindex="0">${logo}
+      <div class="meta"><div class="name">${esc(c.name)}</div><div class="sub">${esc(c.country || "International")}${c.geo ? " · may be geo-blocked" : ""}</div></div>
+      <button class="star${favs.has(c.id) ? " on" : ""}" data-fav="${esc(c.id)}" aria-label="Favorite">★</button></div>`;
+  }).join("");
+  $("list").innerHTML = html || `<div class="empty">${state.cat === "__fav" ? "No favorites yet. Tap ★ on a channel to save it." : "No channels match your search."}</div>`;
+  $("more").hidden = list.length <= state.shown;
+}
+
+function toggleFav(id) {
+  favs.has(id) ? favs.delete(id) : favs.add(id);
+  store.set("favs-ftv", JSON.stringify([...favs]));
+  if (state.playing) $("nowstar").classList.toggle("on", favs.has(state.playing));
+  render();
+}
+
+function showMsg(t) { $("msg").style.display = t ? "block" : "none"; $("msg").textContent = t || ""; }
+
+function play(id) {
+  const ch = channels.find(c => c.id === id); if (!ch) return;
+  state.playing = id; urls = streams[id].slice(); idx = 0;
+  $("player").classList.add("on");
+  $("nowname").textContent = ch.name;
+  $("nowstar").classList.toggle("on", favs.has(id));
+  window.scrollTo({top: 0, behavior: "smooth"});
+  start(); render();
+}
+
+function stop() {
+  if (hls) { hls.destroy(); hls = null; }
+  const v = $("v"); v.pause(); v.removeAttribute("src"); v.load();
+}
+
+function next() {
+  if (idx + 1 < urls.length) { idx++; start(); return; }
+  stop();
+  dead.add(state.playing);
+  try { const d = JSON.parse(localStorage.getItem("dead-ftv") || "{}"); d[state.playing] = Date.now(); localStorage.setItem("dead-ftv", JSON.stringify(d)); } catch (e) {}
+  showMsg("This channel isn't working right now. Try another one.");
+  render();
+}
+
+function start() {
+  stop(); showMsg(urls.length > 1 ? `Connecting (source ${idx + 1} of ${urls.length})…` : "Connecting…");
+  const v = $("v"), url = urls[idx];
+  const onPlaying = () => showMsg("");
+  v.onplaying = onPlaying;
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({enableWorker: true, lowLatencyMode: true});
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) next(); });
+    hls.loadSource(url); hls.attachMedia(v);
+    v.play().catch(() => {});
+  } else if (v.canPlayType("application/vnd.apple.mpegurl")) {
+    v.src = url; v.onerror = next; v.play().catch(() => {});
+  } else { showMsg("This device can't play live streams."); }
+}
+
+// Events
+$("q").addEventListener("input", e => { state.q = e.target.value; state.shown = 60; render(); });
+$("country").addEventListener("change", e => { state.country = e.target.value; state.shown = 60; render(); });
+$("chips").addEventListener("click", e => {
+  const b = e.target.closest(".chip"); if (!b) return;
+  if (b.dataset.more) { const o = $("chips").classList.toggle("open"); b.textContent = o ? "Less ▴" : "More ▾"; return; }
+  document.querySelectorAll(".chip").forEach(x => x.classList.toggle("on", x === b));
+  state.cat = b.dataset.c; state.shown = 60; render();
+});
+$("list").addEventListener("click", e => {
+  const f = e.target.closest("[data-fav]");
+  if (f) { e.stopPropagation(); return toggleFav(f.dataset.fav); }
+  const c = e.target.closest(".ch"); if (c) play(c.dataset.id);
+});
+$("list").addEventListener("keydown", e => { if (e.key === "Enter") { const c = e.target.closest(".ch"); if (c) play(c.dataset.id); } });
+$("more").addEventListener("click", () => { state.shown += 60; render(); });
+$("nowstar").addEventListener("click", () => state.playing && toggleFav(state.playing));
+$("close").addEventListener("click", () => { stop(); state.playing = null; showMsg(""); $("player").classList.remove("on"); render(); });
+
+init();
+</script>
+</body>
+</html>
